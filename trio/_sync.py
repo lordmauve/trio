@@ -1,4 +1,5 @@
 import math
+from collections import OrderedDict
 
 import attr
 
@@ -878,3 +879,52 @@ class EventStream(metaclass=Final):
                     return
                 else:
                     await self._wait()
+
+    async def subscribe_slices(self, from_start=False):
+        """Subscribe to events on the stream.
+
+        Yield slice objects giving the cursor range that is covered by this
+        wakeup.
+
+        """
+        lastpos = 0 if from_start else self._write_cursor + 1
+        async for read_cursor in self._evstream.subscribe():
+            yield slice(lastpos, read_cursor + 1)
+            lastpos = read_cursor + 1
+
+
+@attr.s
+class SharedChannel(metaclass=Final):
+    _evstream = attr.ib(factory=EventStream)
+    _messages = attr.ib(factory=dict)
+    _readers = attr.ib(factory=OrderedDict)
+    _next_id = attr.ib(default=0)
+
+    def put(self, msg):
+        if self._readers:
+            write_cursor = self._evstream.fire()
+            self._messages[write_cursor] = msg
+
+    async def subscribe(self):
+        reader_id = self._next_id
+        self._next_id += 1
+        try:
+            self._readers[reader_id] = self._evstream._write_cursor + 1
+            async for rng in self._evstream.subscribe_slices():
+                batch = [self._messages[i] for i in range(rng.start, rng.stop)]
+
+                # Use an ordereddict (linked list based) to efficiently find
+                # the reader that is most far behind, and evict messages up
+                # to that point
+                self._readers.move_to_end(reader_id)
+                self._readers[reader_id] = rng.stop
+                _, pos = next(iter(self._readers.items()))
+                for i in range(rng.start, pos):
+                    del self._messages[i]
+
+                for msg in batch:
+                    yield msg
+
+        finally:
+            del self._readers[reader_id]
+
